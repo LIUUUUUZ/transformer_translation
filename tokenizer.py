@@ -72,6 +72,8 @@ class SentencePieceTokenizer:
     def encode(
         self,
         text: str|List[str],
+        text_target: List[str] = None,
+        prepare_decoder_input_ids_from_labels: bool = False,
         add_bos: bool = False,
         add_eos: bool = True,
         max_length: Optional[int] = None,
@@ -92,25 +94,100 @@ class SentencePieceTokenizer:
 
             # 截断处理
             if truncation and max_length:
-                id_list = [id[:max_length] for id in batch_input_ids]
+                batch_input_ids = [id[:max_length] for id in batch_input_ids]
 
              # 自动填充逻辑
             if padding == 'max_length' and max_length is not None:
-                padded_ids = [id + [self.special_tokens_int["pad"]] * (max_length - len(id)) for id in id_list]
+                padded_input_ids = [id + [self.special_tokens_int["pad"]] * (max_length - len(id)) for id in batch_input_ids]
             elif padding == 'longest':
-                pass
+                max_len = max(len(ids) for ids in batch_input_ids)
+                padded_input_ids = [
+                    ids + [self.special_tokens_int["pad"]] * (max_len - len(ids))
+                    for ids in batch_input_ids
+                ]
 
             # 转换为Tensor列表
-            padded_ids = torch.tensor(padded_ids)
+            padded_ids = torch.tensor(padded_input_ids)
 
              # 生成注意力掩码
             attention_mask = (padded_ids != self.special_tokens_int["pad"]).type(torch.LongTensor)
 
-        if return_tensors == "pt":
-            return {
-                "input_ids": padded_ids,
-                "attention_mask": attention_mask
+            return_dict = {
+            "input_ids": padded_ids,
+            "attention_mask": attention_mask,
             }
+
+            # label输入的处理
+            labels = None
+            decoder_input_ids = None
+            if text_target is not None:
+                with ThreadPoolExecutor() as executor:
+                    batch_label_ids = list(executor.map(
+                        lambda t: self.sp_model.encode(t, add_bos=False, add_eos=True),
+                        text_target
+                    ))
+                
+                # Truncate labels
+                if truncation and max_length is not None:
+                    batch_label_ids = [ids[:max_length] for ids in batch_label_ids]
+                
+                # Pad labels
+                if padding == 'max_length' and max_length is not None:
+                    padded_label_ids = [
+                        ids + [self.special_tokens_int["pad"]] * (max_length - len(ids))
+                        for ids in batch_label_ids
+                    ]
+                elif padding == 'longest':
+                    max_len = max(len(ids) for ids in batch_label_ids)
+                    padded_label_ids = [
+                        ids + [self.special_tokens_int["pad"]] * (max_len - len(ids))
+                        for ids in batch_label_ids
+                    ]
+                else:
+                    padded_label_ids = batch_label_ids
+                
+                labels_tensor = torch.tensor(padded_label_ids)
+                labels = torch.where(labels_tensor != self.special_tokens_int["pad"], labels_tensor, -100)
+                
+                # Generate decoder_input_ids from labels if required
+                if prepare_decoder_input_ids_from_labels:
+                    batch_decoder_input_ids = []
+                    for label_ids in batch_label_ids:
+                        if len(label_ids) == 0:
+                            decoder_ids = [self.special_tokens_int["bos"]]
+                        else:
+                            decoder_ids = [self.special_tokens_int["bos"]] + label_ids[:-1]
+                        batch_decoder_input_ids.append(decoder_ids)
+                    
+                    # Truncate decoder_input_ids
+                    if truncation and max_length is not None:
+                        batch_decoder_input_ids = [ids[:max_length] for ids in batch_decoder_input_ids]
+                    
+                    # Pad decoder_input_ids
+                    if padding == 'max_length' and max_length is not None:
+                        padded_decoder_ids = [
+                            ids + [self.special_tokens_int["pad"]] * (max_length - len(ids))
+                            for ids in batch_decoder_input_ids
+                        ]
+                    elif padding == 'longest':
+                        max_len = max(len(ids) for ids in batch_decoder_input_ids)
+                        padded_decoder_ids = [
+                            ids + [self.special_tokens_int["pad"]] * (max_len - len(ids))
+                            for ids in batch_decoder_input_ids
+                        ]
+                    else:
+                        padded_decoder_ids = batch_decoder_input_ids
+                    
+                    decoder_input_ids = torch.tensor(padded_decoder_ids)
+
+            if labels is not None:
+                return_dict["labels"] = labels
+
+            if decoder_input_ids is not None:
+                return_dict["decoder_input_ids"] = decoder_input_ids
+
+        if return_tensors == "pt":
+            return return_dict
         else:
             raise ValueError(f"Unsupported tensor type: {return_tensors}")
     
